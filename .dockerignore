@@ -1,0 +1,35 @@
+# ==============================================================================
+# Docker Ignore Rules
+# ==============================================================================
+
+# Virtual Environments (Local Testing)
+venv/
+.venv/
+env/
+ENV/
+
+# Python compiled bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Environment Variables and Secrets
+.env
+*.pem
+*.key
+
+# Git and IDE Workspace metadata
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+*.code-workspace
+
+# Local Storage and temporary logs
+qdrant_storage/
+*.log

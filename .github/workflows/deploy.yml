@@ -1,0 +1,124 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: rag-fastapi-backend
+  CONTAINER_NAME: rag_fastapi_backend
+
+jobs:
+  build-and-push:
+    name: Build & Push Image to Amazon ECR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Docker Image
+        # Note: Do NOT pass credentials as build-args. Images remain completely credential-free.
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+  deploy:
+    name: Deploy Container to AWS EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Execute Remote Deployment via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: ECR_REGISTRY,IMAGE_TAG,QDRANT_URL,QDRANT_API_KEY,GEMINI_API_KEY,ECR_REPOSITORY,CONTAINER_NAME,AWS_REGION
+          script: |
+            set -e
+
+            # 1. Authenticate Docker with Amazon ECR on EC2
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+            # 2. Securely create runtime .env file with restricted permissions (0600)
+            # Secrets are injected directly at runtime, never baked into the container image
+            DEPLOY_DIR="/opt/rag-backend"
+            sudo mkdir -p $DEPLOY_DIR
+            sudo chown -R $USER:$USER $DEPLOY_DIR
+            cd $DEPLOY_DIR
+
+            cat << 'EOF' > .env.tmp
+            QDRANT_URL=__QDRANT_URL__
+            QDRANT_API_KEY=__QDRANT_API_KEY__
+            GEMINI_API_KEY=__GEMINI_API_KEY__
+            GEMINI_MODEL=gemini-2.5-flash
+            EMBEDDING_MODEL=text-embedding-004
+            EMBEDDING_DIMENSION=768
+            QDRANT_COLLECTION_NAME=rag_documents
+            CHUNK_SIZE=1000
+            CHUNK_OVERLAP=150
+            DEFAULT_TOP_K=4
+            EOF
+
+            # Safely substitute secret values into .env and lock down permissions
+            sed -e "s|__QDRANT_URL__|$QDRANT_URL|g" \
+                -e "s|__QDRANT_API_KEY__|$QDRANT_API_KEY|g" \
+                -e "s|__GEMINI_API_KEY__|$GEMINI_API_KEY|g" \
+                .env.tmp > .env
+            rm -f .env.tmp
+            chmod 600 .env
+
+            # 3. Pull latest image from Amazon ECR
+            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+            # 4. Stop and replace running container
+            docker stop $CONTAINER_NAME 2>/dev/null || true
+            docker rm $CONTAINER_NAME 2>/dev/null || true
+
+            # 5. Start new container injecting runtime environment securely
+            docker run -d \
+              --name $CONTAINER_NAME \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              --env-file .env \
+              $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+            # 6. Verify container status and health
+            sleep 5
+            docker ps --filter "name=$CONTAINER_NAME"
+            curl -f http://localhost:8000/health || (echo "Health check failed" && docker logs --tail 50 $CONTAINER_NAME && exit 1)
